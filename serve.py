@@ -1721,7 +1721,8 @@ def _dep_specs(deps: Any) -> list[DepSpec]:
     raise TypeError(f"deps 必须是 Mapping / Sequence / None，收到 {type(deps).__name__}")
 
 
-def _default_dep_specs(env: Mapping[str, str] | None = None) -> list[DepSpec]:
+def _default_dep_specs(env: Mapping[str, str] | None = None,
+                      logger: Any = None) -> list[DepSpec]:
     """默认三件依赖：store / kv / vector。
 
     默认全是**零依赖、进程内**实现（memory）：服务能起来、探针能真实回答，
@@ -1729,7 +1730,7 @@ def _default_dep_specs(env: Mapping[str, str] | None = None) -> list[DepSpec]:
     "默认可跑、显式才接外部服务" 是这个项目一贯的降级方向。
     """
     e = dict(os.environ if env is None else env)
-    return [DepSpec("store", _make_store(e)),
+    return [DepSpec("store", _make_store(e, logger=logger)),
             DepSpec("kv", _make_kv(e)),
             DepSpec("vector", _make_vector(e))]
 
@@ -1801,9 +1802,59 @@ def _make_embedder(env: Mapping[str, str]) -> Any:
             f"{type(exc).__name__}: {exc}") from exc
 
 
-def _make_store(env: Mapping[str, str]) -> Any:
+def _store_env_notice(kind: str, env: Mapping[str, str], logger: Any = None) -> None:
+    """store 的路径变量**每个后端只认一个名字**，配错要出声。
+
+    现实里最容易踩的两脚（都**静默**，表面上一切正常）：
+
+      * `STORE=sqlite` + `STORE_ROOT`：sqlite 只读 `STORE_PATH`/`STORE_DB`，
+        `STORE_ROOT` 被忽略 → 落到 `:memory:`。重启后 session/checkpoint 全丢，
+        而 `/readyz` 是绿的。
+      * `STORE=file` + `STORE_PATH`：file 只读 `STORE_ROOT`，`STORE_PATH` 被
+        忽略 → 落到默认 `/tmp/agent-runtime-store`。表现是
+        `/v1/turns/{ctx_id}/resume` 一直 404 ctx_not_found —— 看起来像"ctx 不存在"，
+        实际是服务在另一个目录里找。
+
+    不改行为（沿用 `AGENT_RUNTIME_KV` 的口径：可以兼容别名，但必须留痕），
+    只把"配了却被忽略"这件事说清楚。
+    """
+    if logger is None:
+        return
+    root = str(env.get("AGENT_RUNTIME_STORE_ROOT") or "").strip()
+    path = str(env.get("AGENT_RUNTIME_STORE_PATH") or "").strip()
+    db = str(env.get("AGENT_RUNTIME_DB") or "").strip()
+    try:
+        if kind == "sqlite":
+            if not (path or db) and root:
+                logger.warn(
+                    "store.env_ignored",
+                    backend="sqlite",
+                    ignored="AGENT_RUNTIME_STORE_ROOT",
+                    hint="sqlite 认 AGENT_RUNTIME_STORE_PATH / AGENT_RUNTIME_DB；"
+                         "当前落 :memory:，重启即丢",
+                    effective=":memory:")
+            elif path and db and path != db:
+                logger.warn("store.env_conflict", backend="sqlite",
+                            used="AGENT_RUNTIME_STORE_PATH", ignored=db)
+        elif kind == "file":
+            if path and not root:
+                logger.warn(
+                    "store.env_alias",
+                    backend="file",
+                    note="file 后端读 AGENT_RUNTIME_STORE_ROOT；"
+                         "本次把 AGENT_RUNTIME_STORE_PATH 当 root 用",
+                    effective=path)
+            elif root and path and root != path:
+                logger.warn("store.env_conflict", backend="file",
+                            used="AGENT_RUNTIME_STORE_ROOT", ignored=path)
+    except Exception:                   # noqa: BLE001 - 观测面 fail-open
+        pass
+
+
+def _make_store(env: Mapping[str, str], logger: Any = None) -> Any:
     """按 `AGENT_RUNTIME_STORE` 造 Context 存储（memory / sqlite / file / redis）。"""
     kind = str(env.get("AGENT_RUNTIME_STORE") or "memory").strip().lower()
+    _store_env_notice(kind, env, logger)
     try:
         if kind == "memory":
             from core.store import MemoryStore
@@ -1813,13 +1864,17 @@ def _make_store(env: Mapping[str, str]) -> Any:
             # 别名兼容：`AGENT_RUNTIME_DB` 是更直观的名字（文档/直觉都用它），
             # 但早期实现只认 `AGENT_RUNTIME_STORE_PATH` —— 配了前者会**静默退化成
             # 内存库**（surface 表现是"重启后数据没了"）。两个都认，冲突时以显式
-            # 的 STORE_PATH 为准，并在两边都给时打日志提示。
+            # 的 STORE_PATH 为准；被忽略的那个由 `_store_env_notice` 出声。
             path = (env.get("AGENT_RUNTIME_STORE_PATH")
                     or env.get("AGENT_RUNTIME_DB") or ":memory:")
             return SQLiteStore(path)
         if kind == "file":
             from core.store import FileStore
-            root = env.get("AGENT_RUNTIME_STORE_ROOT") or ""
+            # **`STORE_PATH` 也认**：它比 `STORE_ROOT` 更通用，绝大多数人会先
+            # 试它；只认 ROOT 的结果是"配了路径却落在默认目录"，且只在
+            # `/v1/turns/{ctx_id}/resume` 404 时才暴露。
+            root = (env.get("AGENT_RUNTIME_STORE_ROOT")
+                    or env.get("AGENT_RUNTIME_STORE_PATH") or "")
             return FileStore(root) if root else FileStore()
         if kind == "redis":
             # **会话/检查点跨副本的唯一路径**。
@@ -3617,7 +3672,7 @@ def create_app(*, gateway: Any = None, metrics: Any = None,
         logger=logger,
         runner_factory=workflow_runner_factory,
         # 持久化：给了 store 就落盘，进程重启能读回来（标记 interrupted）
-        store=workflow_store if workflow_store is not None else _make_store(os.environ),
+        store=workflow_store if workflow_store is not None else _make_store(os.environ, logger=logger),
     )
     #: 谁装配谁负责收口：注入方自己管生命周期（与 `built_here` 处理 gateway 同一口径）
     app.state.workflows_built_here = True
@@ -4863,6 +4918,22 @@ def build_gateway_from_env(*, logger: Any = None,
             # 配了 Extractor 却装不上 → 报错。静默不装等于"记忆永远为空"。
             raise RuntimeError(f"Memory 装配失败：{type(exc).__name__}: {exc}") from exc
 
+    # **配了记忆面却没配 Extractor：出声。**
+    # `AGENT_RUNTIME_SEMANTIC` / `AGENT_RUNTIME_RECALL_K` 都嵌在
+    # `if extractor_factory is not None:` 里 —— 语义上没错（没有记忆就没有召回），
+    # 但"配了不生效、日志一个字不提"正是本仓反复踩的那类坑：
+    # 运维会以为语义召回开着，实际连记忆面都没装。
+    if extractor_factory is None and logger is not None:
+        for key, event in (("AGENT_RUNTIME_SEMANTIC", "memory.semantic_ignored"),
+                           ("AGENT_RUNTIME_RECALL_K", "memory.recall_k_ignored")):
+            raw = str(e.get(key) or "").strip()
+            if raw and raw not in ("0", "false", "False"):
+                try:
+                    logger.warn(event, reason="未配置 AGENT_RUNTIME_EXTRACTOR，"
+                                              "记忆面未装配，该开关不会生效")
+                except Exception:            # noqa: BLE001 - 观测面 fail-open
+                    pass
+
     # ── 其余可选能力：Router / Skills / 规划器 / 历史压缩 ──
     router_obj = _instantiate(load_extension(e.get("AGENT_RUNTIME_ROUTER"),
                                              kind="router", logger=logger))
@@ -5175,7 +5246,7 @@ def build_gateway_from_env(*, logger: Any = None,
                     parallel_tools=_truthy(e.get("AGENT_RUNTIME_PARALLEL_TOOLS", "1")),
                     max_parallel_tools=int(e.get("AGENT_RUNTIME_MAX_PARALLEL_TOOLS") or 4))
 
-    gw_store = store if store is not None else _make_store(e)
+    gw_store = store if store is not None else _make_store(e, logger=logger)
 
     # ── 回合级钩子：把 wiring 接到 Gateway 上 ──────────────────
     # `before_turn` 必须在第一次调模型前跑完（Memory 召回 / 技能装载 / 路由），

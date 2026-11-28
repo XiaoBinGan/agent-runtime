@@ -247,6 +247,43 @@ now, and the suite is green on a machine with the Docker CLI installed and no
 daemon running — the configuration that made the gate red.
 
 
+### Three silent degradations, reported downstream
+
+**`STORE_PATH` and `STORE_ROOT` are not interchangeable.** `sqlite` reads
+`STORE_PATH` / `STORE_DB`; `file` reads `STORE_ROOT`. Set
+`STORE=sqlite` with `STORE_ROOT=/data` and the store lands on `:memory:` —
+sessions and checkpoints vanish on restart while `/readyz` stays green. Set
+`STORE=file` with `STORE_PATH=/tmp/x` and it lands on the default
+`/tmp/agent-runtime-store`, which surfaces as `/v1/turns/{ctx_id}/resume`
+answering 404 `ctx_not_found` forever. Neither case logged anything, and the
+comment above the sqlite branch claimed a warning existed that did not.
+
+`file` now accepts `STORE_PATH` as a root (and says so), and both branches emit
+`store.env_ignored` / `store.env_alias` / `store.env_conflict` when a
+configured name is being discarded. Behaviour for correctly-named config is
+unchanged, matching how `AGENT_RUNTIME_KV` aliases are handled.
+
+**The soak criteria never ran.** `scripts/soak_test.py` computed its verdicts in
+`main()` but read `rss_vals`, a local of `run()`. Every soak therefore ended
+with `NameError: name 'rss_vals' is not defined` — after printing the summary,
+so the numbers looked complete while the leak criterion had never executed. The
+12-hour runs that uncovered the `_records` leak were read by eye for exactly
+this reason.
+
+`run()` now returns `rss_series` / `fd_series`, the criteria live in a pure
+`_verdicts(res)` function, and a missing series fails loudly instead of
+crashing. Six cases pin it: flat passes, a 100 → 220 MB ramp fails only the
+memory verdict, missing series fails without a traceback, fd/thread/p99
+degradation each fail their own.
+
+**`SEMANTIC` / `RECALL_K` were silent no-ops without an extractor.** Both live
+inside `if extractor_factory is not None:` — correct, since recall needs a
+memory plane — but setting them without `AGENT_RUNTIME_EXTRACTOR` produced no
+output at all. They now emit `memory.semantic_ignored` / `memory.recall_k_ignored`.
+
+Verification: 2,349 tests, 11/11 demo scenarios (80/80), 55 HTTP cases, 8 gates
+green.
+
 ### The 12-hour soak found a linear leak
 
 The 150-minute run was flat, so the 12-hour run was expected to be the same

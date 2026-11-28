@@ -208,6 +208,13 @@ async def run(url: str, pid: int, minutes: float, concurrency: int,
         "codes": {str(k): v for k, v in sorted(codes.items(), key=lambda kv: str(kv[0]))},
         "baseline": base,
         "samples": samples,
+        # **判据要用原始序列**。早先只在 `main()` 里引用 `rss_vals` ——
+        # 那是 `run()` 的局部变量，`main()` 里根本不存在，于是每次长稳跑到
+        # 最后都抛 `NameError: name 'rss_vals' is not defined`：
+        # 摘要打印完了、JSON 也写了，但**判据那一段从未真正执行过**。
+        # 一条"判据"从未生效，等于没有判据 —— 这才是最该修的地方。
+        "rss_series": [round(v, 1) for v in rss_vals],
+        "fd_series": [int(s["fds"]) for s in samples],
         "rss_slope_mb_per_min": round(_slope(rss_pts), 3),
         "rss_trough_slope_mb_per_poll": rss_trough_slope,
         "rss_trough_first": trough_first,
@@ -224,6 +231,41 @@ async def run(url: str, pid: int, minutes: float, concurrency: int,
         "p99_first": first_p99,
         "p99_last": last_p99,
     }
+
+
+def _verdicts(res: dict) -> list[tuple[str, bool]]:
+    """长稳判据（纯函数：只看 `res`，不碰网络/进程）。
+
+    抽出来的理由：这段原来写在 `main()` 里并直接引用 `run()` 的局部变量
+    `rss_vals`，于是**每次长稳跑到最后都抛 NameError** —— 摘要打印完了、
+    JSON 也写了，判据一段从未执行。一条从不执行的判据等于没有判据。
+    """
+    series = res.get("rss_series") or []
+    if not series:
+        return [("内存采样序列存在（没有序列就无法判断趋势）", False)]
+
+    verdicts: list[tuple[str, bool]] = []
+    n3 = max(1, len(series) // 3)
+    head_mean = sum(series[:n3]) / n3
+    tail_seg = series[-n3:]
+    tail_mean = sum(tail_seg) / len(tail_seg)
+    res["rss_head_mean"] = round(head_mean, 1)
+    res["rss_tail_mean"] = round(tail_mean, 1)
+    res["rss_peak_head"] = round(max(series[:n3]), 1)
+    res["rss_peak_tail"] = round(max(tail_seg), 1)
+
+    # 阈值 1.25：允许 25% 的阶段均值波动（GC 时机、缓存填充都会动它），
+    # 超过就是真增长。实测健康值 97.1/101.3 = 0.96。
+    verdicts.append((
+        f"内存无泄漏（阶段均值 {res['rss_head_mean']}→{res['rss_tail_mean']}MB，"
+        f"比值 {tail_mean / head_mean:.2f}）",
+        tail_mean <= head_mean * 1.25))
+    verdicts.append(("句柄无泄漏（<1个/min）", res["fd_slope_per_min"] < 1.0))
+    verdicts.append((f"线程恒定（{res['threads_min']}~{res['threads_max']}）",
+                     res["threads_max"] - res["threads_min"] <= 4))
+    p99_ok = res["p99_last"] <= max(res["p99_first"] * 1.5, res["p99_first"] + 50)
+    verdicts.append((f"p99 未随时间恶化（{res['p99_first']}→{res['p99_last']}ms）", p99_ok))
+    return verdicts
 
 
 def main() -> int:
@@ -258,41 +300,7 @@ def main() -> int:
     print(f"  p99 首段 {res['p99_first']}ms → 末段 {res['p99_last']}ms")
     print()
 
-    # 判据：都是"趋势"而不是绝对值
-    verdicts = []
-    # 判据：**谷值不抬高**。抬高说明每个 GC 周期后剩下的更多 = 真泄漏。
-    # **判据：分阶段均值，不是谷值也不是全点斜率。**
-    #
-    # 三种方法都用过 150 分钟的真实数据（103 万请求）验证：
-    #
-    #   * 全点线性拟合 → -0.109 MB/min（负的，但被峰值噪声主导：RSS 在
-    #     55~487MB 之间摆动，拟合结果取决于末次采样落在峰还是谷）
-    #   * 谷值斜率       → +0.68 MB/采样（看着像泄漏，实际是 t=20min 的
-    #     偶发低谷 55.2MB 拉低了起点；谷值序列本身有起有落，不单调）
-    #   * **分阶段均值** → 前 101.3 / 中 101.3 / 后 97.1 MB（稳定且略降）
-    #
-    # 长序列里偶发低谷/峰值会被前两种方法放大成假信号。阶段均值对单个
-    # 异常采样不敏感，才是"稳态有没有涨"的正确问法。
-    n3 = max(1, len(rss_vals) // 3)
-    head_mean = sum(rss_vals[:n3]) / n3
-    tail_seg = rss_vals[-n3:]
-    tail_mean = sum(tail_seg) / len(tail_seg)
-    res["rss_head_mean"] = round(head_mean, 1)
-    res["rss_tail_mean"] = round(tail_mean, 1)
-    res["rss_peak_head"] = round(max(rss_vals[:n3]), 1)
-    res["rss_peak_tail"] = round(max(tail_seg), 1)
-
-    # 阈值 1.25：允许 25% 的阶段均值波动（GC 时机、缓存填充都会动它），
-    # 超过就是真增长。实测健康值 97.1/101.3 = 0.96。
-    verdicts.append((
-        f"内存无泄漏（阶段均值 {res['rss_head_mean']}→{res['rss_tail_mean']}MB，"
-        f"比值 {tail_mean / head_mean:.2f}）",
-        tail_mean <= head_mean * 1.25))
-    verdicts.append(("句柄无泄漏（<1个/min）", res["fd_slope_per_min"] < 1.0))
-    verdicts.append((f"线程恒定（{res['threads_min']}~{res['threads_max']}）",
-                     res["threads_max"] - res["threads_min"] <= 4))
-    p99_ok = res["p99_last"] <= max(res["p99_first"] * 1.5, res["p99_first"] + 50)
-    verdicts.append((f"p99 未随时间恶化（{res['p99_first']}→{res['p99_last']}ms）", p99_ok))
+    verdicts = _verdicts(res)
 
     failed = 0
     for name, ok in verdicts:
